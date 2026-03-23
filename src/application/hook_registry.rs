@@ -10,7 +10,7 @@ use crate::domain::{AgentError, HookData, HookEvent, HookPatch, HookPayload, Res
 use crate::ports::HookRegistration;
 
 /// 按事件类型分组、按注册顺序保存的 Hook 注册表。
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct HookRegistry {
     handlers: IndexMap<HookEvent, Vec<HookRegistration>>,
 }

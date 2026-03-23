@@ -27,5 +27,6 @@ pub use domain::{
 pub use ports::{
     ChatError, ChatEvent, ChatEventStream, ChatRequest, MemoryStorage, ModelCapabilities,
     ModelInfo, ModelProvider, Plugin, PluginContext, PluginDescriptor, SessionPage,
-    SessionSearchQuery, SessionStorage, SessionSummary, ToolDefinition, ToolHandler, ToolInput,
+    SessionSearchQuery, SessionStorage, SessionSummary, TokenUsage, ToolDefinition, ToolHandler,
+    ToolInput,
 };

@@ -2,6 +2,8 @@
 
 pub(crate) mod context_manager;
 pub(crate) mod hook_registry;
-pub(crate) mod prompt_builder;
-pub(crate) mod request_builder;
+pub mod prompt_builder;
+pub mod request_builder;
 pub(crate) mod session_service;
+pub mod skill_manager;
+pub(crate) mod turn_engine;
