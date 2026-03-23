@@ -17,5 +17,3 @@ pub use state::TurnOutcome;
 pub use types::{
     ContentBlock, Memory, Message, MessageStatus, SkillDefinition, ToolOutput, UserInput,
 };
-
-pub(crate) use state::{LifecycleState, SessionSlotState};

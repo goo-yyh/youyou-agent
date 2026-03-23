@@ -1,4 +1,8 @@
 //! 集成测试使用的伪造 Plugin 实现。
+#![allow(
+    dead_code,
+    reason = "测试支撑会被多个集成测试按需复用，单个测试目标不一定覆盖全部辅助变体。"
+)]
 
 use std::sync::{Arc, Mutex};
 
@@ -13,6 +17,8 @@ pub enum FakePluginApplyBehavior {
     Noop,
     /// 注册一个已声明的 hook。
     RegisterDeclared(HookEvent),
+    /// 注册一个已声明的 hook，并在触发时返回中止结果。
+    RegisterDeclaredAbort(HookEvent, String),
     /// 尝试注册一个未声明的 hook。
     RegisterUndeclared(HookEvent),
 }
@@ -113,11 +119,22 @@ impl Plugin for FakePlugin {
         let event = match &self.apply_behavior {
             FakePluginApplyBehavior::Noop => return,
             FakePluginApplyBehavior::RegisterDeclared(event)
+            | FakePluginApplyBehavior::RegisterDeclaredAbort(event, _)
             | FakePluginApplyBehavior::RegisterUndeclared(event) => event.clone(),
         };
 
-        let _ = ctx.tap(event, |_payload: HookPayload| {
-            Box::pin(async { HookResult::Continue })
+        let hook_result = match &self.apply_behavior {
+            FakePluginApplyBehavior::RegisterDeclaredAbort(_, reason) => {
+                HookResult::Abort(reason.clone())
+            }
+            FakePluginApplyBehavior::Noop
+            | FakePluginApplyBehavior::RegisterDeclared(_)
+            | FakePluginApplyBehavior::RegisterUndeclared(_) => HookResult::Continue,
+        };
+
+        let _ = ctx.tap(event, move |_payload: HookPayload| {
+            let hook_result = hook_result.clone();
+            Box::pin(async move { hook_result })
         });
     }
 

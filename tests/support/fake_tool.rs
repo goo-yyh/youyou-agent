@@ -1,4 +1,8 @@
 //! 集成测试使用的伪造 Tool 实现。
+#![allow(
+    dead_code,
+    reason = "测试支撑会被多个集成测试按需复用，单个测试目标不一定覆盖全部辅助类型。"
+)]
 
 use anyhow::Result as AnyResult;
 use async_trait::async_trait;

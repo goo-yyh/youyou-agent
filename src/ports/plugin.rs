@@ -45,7 +45,7 @@ pub(crate) struct HookRegistration {
     /// Plugin 配置快照。
     pub(crate) plugin_config: serde_json::Value,
     /// 擦除具体类型后的 Hook handler。
-    pub(crate) _handler: HookHandler,
+    pub(crate) handler: HookHandler,
 }
 
 impl fmt::Debug for HookRegistration {
@@ -93,7 +93,7 @@ impl PluginContext {
 
     /// 为 Plugin 注册一个 Hook handler。
     ///
-    /// # 错误
+    /// # Errors
     ///
     /// 当 Plugin 试图注册未在 descriptor 中声明的 hook 时返回错误。
     pub fn tap<F>(&mut self, event: HookEvent, handler: F) -> crate::Result<()>
@@ -105,7 +105,7 @@ impl PluginContext {
             event,
             plugin_id: self.descriptor.id.clone(),
             plugin_config: self.plugin_config.clone(),
-            _handler: Arc::new(handler),
+            handler: Arc::new(handler),
         });
         Ok(())
     }

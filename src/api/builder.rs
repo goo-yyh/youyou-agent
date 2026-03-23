@@ -162,7 +162,7 @@ impl<S> AgentBuilder<S> {
 
     /// 构建不可变的 Agent 外壳。
     ///
-    /// # 错误
+    /// # Errors
     ///
     /// 当校验失败、plugin 初始化失败或 plugin hook 注册失败时，
     /// 返回结构化的 [`AgentError`]。
@@ -174,13 +174,15 @@ impl<S> AgentBuilder<S> {
         validate_model_config(&self.config, &models)?;
         let tools = build_tool_registry(&self.tools)?;
         let skills = build_skill_registry(&self.skills, &tools)?;
-        let (plugins, hook_registry) = build_plugin_registry(self.plugins).await?;
+        let (plugin_instances, plugins, hook_registry) =
+            build_plugin_registry(self.plugins).await?;
 
         Ok(Agent::new(AgentKernel {
             config: self.config,
             models,
             tools,
             skills,
+            plugin_instances,
             plugins,
             hook_registry,
             session_storage: self.session_storage,
@@ -402,6 +404,7 @@ fn build_skill_registry(skills: &[SkillDefinition], tools: &ToolRegistry) -> Res
 async fn build_plugin_registry(
     plugins: Vec<RegisteredPlugin>,
 ) -> Result<(
+    Vec<Arc<dyn Plugin>>,
     IndexMap<String, crate::ports::PluginDescriptor>,
     HookRegistry,
 )> {
@@ -427,7 +430,7 @@ async fn build_plugin_registry(
             return Err(error);
         }
     };
-    Ok((descriptors, hook_registry))
+    Ok((initialized_plugins, descriptors, hook_registry))
 }
 
 fn collect_plugin_descriptors(
