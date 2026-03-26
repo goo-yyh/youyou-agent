@@ -2,6 +2,7 @@
 
 pub(crate) mod context_manager;
 pub(crate) mod hook_registry;
+pub(crate) mod memory_manager;
 pub(crate) mod plugin_manager;
 pub mod prompt_builder;
 pub mod request_builder;

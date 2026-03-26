@@ -67,6 +67,22 @@ impl ModelCatalog for ModelRegistry {
         self.resolve_model(model_id)
             .map(|registered| registered.info.context_window)
     }
+
+    fn resolve_provider(&self, model_id: &str) -> Result<Arc<dyn ModelProvider>> {
+        let registered = self.resolve_model(model_id)?;
+
+        self.providers
+            .get(&registered.provider_id)
+            .cloned()
+            .ok_or_else(|| AgentError::ProviderError {
+                message: format!(
+                    "provider '{}' for model '{}' is not registered",
+                    registered.provider_id, model_id
+                ),
+                source: anyhow::anyhow!("model provider missing from registry"),
+                retryable: false,
+            })
+    }
 }
 
 #[derive(Default)]

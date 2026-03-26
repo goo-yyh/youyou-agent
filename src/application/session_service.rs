@@ -12,18 +12,23 @@ use uuid::Uuid;
 
 use crate::application::context_manager::{ContextManager, payload_to_message};
 use crate::application::hook_registry::HookRegistry;
+use crate::application::memory_manager::{IncrementalExtraction, MemoryManager};
 use crate::domain::{
     AgentConfig, AgentError, CompactionMarker, HookData, LedgerEvent, LedgerEventPayload, Memory,
     MetadataKey, Result, SessionConfig, SessionLedger,
 };
 use crate::ports::{
-    MemoryStorage, Plugin, SessionPage, SessionSearchQuery, SessionStorage, SessionSummary,
+    MemoryStorage, ModelProvider, Plugin, SessionPage, SessionSearchQuery, SessionStorage,
+    SessionSummary,
 };
 
 /// 运行期模型目录需要提供的最小能力。
 pub(crate) trait ModelCatalog {
     /// 根据模型标识解析上下文窗口大小。
     fn resolve_context_window(&self, model_id: &str) -> Result<usize>;
+
+    /// 根据模型标识解析其所属 provider。
+    fn resolve_provider(&self, model_id: &str) -> Result<Arc<dyn ModelProvider>>;
 }
 
 /// Agent 生命周期状态。
@@ -351,6 +356,7 @@ where
             )
             .await?;
 
+        self.run_close_memory_extraction(&runtime, session_id).await;
         self.finish_close(session_id)
     }
 
@@ -582,18 +588,74 @@ where
 
     /// 加载 session 启动时需要注入的 bootstrap 记忆。
     async fn load_bootstrap_memories(&self, namespace: &str) -> Result<Vec<Memory>> {
-        let Some(memory_storage) = &self.memory_storage else {
+        let Some(memory_manager) = self.memory_manager() else {
             return Ok(Vec::new());
         };
 
-        memory_storage
-            .list_recent(namespace, self.agent_config.memory_max_items)
-            .await
-            .map_err(|error| {
-                AgentError::StorageError(error.context(format!(
-                    "failed to load bootstrap memories for namespace '{namespace}'"
-                )))
+        memory_manager.list_recent(namespace).await
+    }
+
+    /// 在 close 路径上执行收尾提取，失败只记录 warn。
+    async fn run_close_memory_extraction(
+        &self,
+        runtime: &Arc<AsyncMutex<SessionRuntime>>,
+        session_id: &str,
+    ) {
+        let Some(memory_manager) = self.memory_manager() else {
+            return;
+        };
+
+        let mut runtime = runtime.lock().await;
+        let memory_model_id = self.resolve_memory_model_id(&runtime.model_id);
+        let provider = match self.models.resolve_provider(&memory_model_id) {
+            Ok(provider) => provider,
+            Err(error) => {
+                warn!(
+                    session_id = %session_id,
+                    error = %error,
+                    "failed to resolve memory provider during session close"
+                );
+                return;
+            }
+        };
+        let source = format!("session:{session_id}");
+
+        match memory_manager
+            .extract_incremental(IncrementalExtraction {
+                namespace: &runtime.memory_namespace,
+                ledger: &runtime.ledger,
+                last_checkpoint_seq: runtime.last_memory_checkpoint_seq,
+                source: &source,
+                provider: provider.as_ref(),
+                model_id: &memory_model_id,
+                cancel: &CancellationToken::new(),
             })
+            .await
+        {
+            Ok(Some(last_seq)) => {
+                if let Err(error) = persist_memory_checkpoint_metadata(
+                    &mut runtime,
+                    self.session_storage.as_deref(),
+                    last_seq,
+                )
+                .await
+                {
+                    warn!(
+                        session_id = %session_id,
+                        error = %error,
+                        "failed to persist memory checkpoint during session close"
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(
+                    session_id = %session_id,
+                    error = %error,
+                    "memory close extraction failed; skipping without blocking close"
+                );
+            }
+        }
     }
 
     /// 从账本中恢复会话关键配置。
@@ -804,6 +866,21 @@ where
                 message: format!("agent control mutex poisoned: {error}"),
             })
     }
+
+    /// 按当前配置构造一个记忆管理器。
+    fn memory_manager(&self) -> Option<MemoryManager> {
+        self.memory_storage
+            .clone()
+            .map(|storage| MemoryManager::new(storage, self.agent_config.memory_max_items))
+    }
+
+    /// 解析当前会话应使用的记忆模型标识。
+    fn resolve_memory_model_id(&self, session_model_id: &str) -> String {
+        self.agent_config
+            .memory_model
+            .clone()
+            .unwrap_or_else(|| session_model_id.to_string())
+    }
 }
 
 /// 统一的关键事件写入路径。
@@ -833,6 +910,27 @@ pub(crate) async fn persist_and_project(
     runtime.ledger.append(event.clone());
     project_ledger_payload(runtime, &event.payload)?;
     Ok(event)
+}
+
+/// 持久化一条记忆 checkpoint metadata，并同步更新运行时边界。
+///
+/// # 错误
+///
+/// 当 metadata 无法持久化时返回错误。
+pub(crate) async fn persist_memory_checkpoint_metadata(
+    runtime: &mut SessionRuntime,
+    storage: Option<&dyn SessionStorage>,
+    last_seq: u64,
+) -> Result<LedgerEvent> {
+    persist_and_project(
+        runtime,
+        storage,
+        LedgerEventPayload::Metadata {
+            key: MetadataKey::MemoryCheckpoint,
+            value: serde_json::json!({ "lastSeq": last_seq }),
+        },
+    )
+    .await
 }
 
 /// 将已落盘事件投影到运行时状态。

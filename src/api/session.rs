@@ -9,10 +9,11 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::api::RunningTurn;
+use crate::application::memory_manager::MemoryManager;
 use crate::application::session_service::{AgentControl, SessionDescriptor, SessionService};
 use crate::application::skill_manager::SkillManager;
 use crate::application::tool_dispatcher::ToolDispatcher;
-use crate::application::turn_engine::{self, TurnEngineDeps};
+use crate::application::turn_engine::{self, MemoryTurnDeps, TurnEngineDeps};
 use crate::domain::{AgentError, ContentBlock, Message, Result, UserInput};
 use crate::ports::ModelCapabilities;
 use crate::prompt::templates::DEFAULT_COMPACT_PROMPT;
@@ -210,6 +211,7 @@ impl SessionHandle {
             .unwrap_or_else(|| self.model_id.clone());
         let compact_registered_model = self.kernel.models.resolve_model(&compact_model_id)?;
         let compact_provider = self.resolve_provider_for_model(&compact_model_id)?;
+        let memory = self.build_memory_turn_deps()?;
 
         Ok(TurnEngineDeps {
             agent_config: self.kernel.config.clone(),
@@ -224,6 +226,7 @@ impl SessionHandle {
                 .compact_prompt
                 .clone()
                 .unwrap_or_else(|| DEFAULT_COMPACT_PROMPT.to_string()),
+            memory,
             plugins: self.kernel.plugins.values().cloned().collect(),
             implicit_skills: self
                 .kernel
@@ -243,6 +246,27 @@ impl SessionHandle {
             hook_registry: self.kernel.hook_registry.clone(),
             session_storage: self.kernel.session_storage.clone(),
         })
+    }
+
+    /// 构造 turn 期间使用的记忆依赖。
+    fn build_memory_turn_deps(&self) -> Result<Option<MemoryTurnDeps>> {
+        let Some(storage) = self.kernel.memory_storage.clone() else {
+            return Ok(None);
+        };
+
+        let model_id = self
+            .kernel
+            .config
+            .memory_model
+            .clone()
+            .unwrap_or_else(|| self.model_id.clone());
+        let provider = self.resolve_provider_for_model(&model_id)?;
+
+        Ok(Some(MemoryTurnDeps {
+            manager: MemoryManager::new(storage, self.kernel.config.memory_max_items),
+            provider,
+            model_id,
+        }))
     }
 
     /// 为指定模型解析其所属的 provider。

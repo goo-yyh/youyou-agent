@@ -5,12 +5,16 @@ use std::sync::Arc;
 use anyhow::anyhow;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
 
+use crate::application::memory_manager::{IncrementalExtraction, MemoryManager};
 use crate::application::prompt_builder::{PromptBuildContext, PromptBuilder, RenderedPrompt};
 use crate::application::request_builder::{
     ChatRequestBuilder, RequestBuildOptions, ResolvedSessionConfig,
 };
-use crate::application::session_service::{SessionRuntime, persist_and_project};
+use crate::application::session_service::{
+    SessionRuntime, persist_and_project, persist_memory_checkpoint_metadata,
+};
 use crate::application::tool_dispatcher::{RequestedToolCall, ToolDispatcher};
 use crate::domain::{
     AgentConfig, AgentError, AgentEvent, AgentEventPayload, ContentBlock, HookData, HookPatch,
@@ -37,6 +41,8 @@ pub(crate) struct TurnEngineDeps {
     pub(crate) compact_model_capabilities: ModelCapabilities,
     /// compact 使用的 prompt 文本。
     pub(crate) compact_prompt: String,
+    /// 可选的记忆执行依赖。
+    pub(crate) memory: Option<MemoryTurnDeps>,
     /// 当前会话激活的 plugin 描述。
     pub(crate) plugins: Vec<PluginDescriptor>,
     /// 允许隐式展示的 skill 列表。
@@ -49,6 +55,17 @@ pub(crate) struct TurnEngineDeps {
     pub(crate) hook_registry: crate::application::hook_registry::HookRegistry,
     /// 可选的会话存储。
     pub(crate) session_storage: Option<Arc<dyn SessionStorage>>,
+}
+
+/// 单轮 turn 使用的记忆依赖。
+#[derive(Clone)]
+pub(crate) struct MemoryTurnDeps {
+    /// 记忆管理器。
+    pub(crate) manager: MemoryManager,
+    /// 记忆提取使用的 provider。
+    pub(crate) provider: Arc<dyn ModelProvider>,
+    /// 记忆提取使用的模型标识。
+    pub(crate) model_id: String,
 }
 
 /// 单次模型请求迭代的结果。
@@ -141,6 +158,7 @@ async fn run_turn_inner(
     let mut runtime = runtime.lock().await;
     let dynamic_sections =
         dispatch_turn_start(&deps.hook_registry, &runtime.session_id, &turn_id, &input).await?;
+    let turn_memories = load_turn_memories(&runtime, &deps, &input).await;
 
     persist_skill_injections(
         &mut runtime,
@@ -156,6 +174,7 @@ async fn run_turn_inner(
 
     loop {
         if cancel.is_cancelled() {
+            run_memory_checkpoint_if_needed(&mut runtime, &deps, &cancel).await;
             return finalize_cancelled_turn(
                 &mut runtime,
                 &deps.hook_registry,
@@ -167,7 +186,7 @@ async fn run_turn_inner(
             .await;
         }
 
-        let prompt = build_turn_prompt(&deps, &runtime, &dynamic_sections);
+        let prompt = build_turn_prompt(&deps, &runtime, &dynamic_sections, &turn_memories);
         match maybe_compact_before_request(
             &mut runtime,
             &deps,
@@ -231,6 +250,7 @@ async fn run_turn_inner(
                 .await?;
             }
 
+            run_memory_checkpoint_if_needed(&mut runtime, &deps, &cancel).await;
             return finalize_cancelled_turn(
                 &mut runtime,
                 &deps.hook_registry,
@@ -253,6 +273,7 @@ async fn run_turn_inner(
         }
 
         if iteration.tool_calls.is_empty() {
+            run_memory_checkpoint_if_needed(&mut runtime, &deps, &cancel).await;
             return finalize_completed_turn(
                 &mut runtime,
                 &deps.hook_registry,
@@ -312,6 +333,7 @@ async fn run_turn_inner(
         tool_calls_count = tool_calls_count.saturating_add(batch_outcome.results.len());
 
         if batch_outcome.cancelled {
+            run_memory_checkpoint_if_needed(&mut runtime, &deps, &cancel).await;
             return finalize_cancelled_turn(
                 &mut runtime,
                 &deps.hook_registry,
@@ -374,6 +396,7 @@ fn build_turn_prompt(
     deps: &TurnEngineDeps,
     runtime: &SessionRuntime,
     dynamic_sections: &[String],
+    memories: &[crate::domain::Memory],
 ) -> RenderedPrompt {
     PromptBuilder::new().build(
         &deps.agent_config,
@@ -381,10 +404,41 @@ fn build_turn_prompt(
         &PromptBuildContext {
             implicit_skills: deps.implicit_skills.clone(),
             plugins: deps.plugins.clone(),
-            memories: runtime.bootstrap_memories.clone(),
+            memories: memories.to_vec(),
             dynamic_sections: dynamic_sections.to_vec(),
         },
     )
+}
+
+/// 以 best-effort 方式加载本轮记忆。
+async fn load_turn_memories(
+    runtime: &SessionRuntime,
+    deps: &TurnEngineDeps,
+    input: &UserInput,
+) -> Vec<crate::domain::Memory> {
+    let Some(memory) = &deps.memory else {
+        return runtime.bootstrap_memories.clone();
+    };
+
+    match memory
+        .manager
+        .load_turn_memories(
+            &runtime.memory_namespace,
+            &runtime.bootstrap_memories,
+            input,
+        )
+        .await
+    {
+        Ok(memories) => memories,
+        Err(error) => {
+            warn!(
+                session_id = %runtime.session_id,
+                error = %error,
+                "failed to load turn memories; falling back to bootstrap memories"
+            );
+            runtime.bootstrap_memories.clone()
+        }
+    }
 }
 
 /// 在请求前根据估算决定是否主动 compact。
@@ -420,6 +474,63 @@ async fn maybe_compact_before_request(
     )
     .await?;
     Ok(())
+}
+
+/// 在 turn 收尾时按轮次执行一次 checkpoint 提取。
+async fn run_memory_checkpoint_if_needed(
+    runtime: &mut SessionRuntime,
+    deps: &TurnEngineDeps,
+    cancel: &CancellationToken,
+) {
+    let Some(memory) = &deps.memory else {
+        return;
+    };
+
+    if runtime.turn_index == 0
+        || !runtime
+            .turn_index
+            .is_multiple_of(deps.agent_config.memory_checkpoint_interval)
+    {
+        return;
+    }
+
+    match memory
+        .manager
+        .extract_incremental(IncrementalExtraction {
+            namespace: &runtime.memory_namespace,
+            ledger: &runtime.ledger,
+            last_checkpoint_seq: runtime.last_memory_checkpoint_seq,
+            source: "checkpoint",
+            provider: memory.provider.as_ref(),
+            model_id: &memory.model_id,
+            cancel,
+        })
+        .await
+    {
+        Ok(Some(last_seq)) => {
+            if let Err(error) = persist_memory_checkpoint_metadata(
+                runtime,
+                deps.session_storage.as_deref(),
+                last_seq,
+            )
+            .await
+            {
+                warn!(
+                    session_id = %runtime.session_id,
+                    error = %error,
+                    "failed to persist memory checkpoint; skipping without aborting turn"
+                );
+            }
+        }
+        Ok(None) | Err(AgentError::RequestCancelled) => {}
+        Err(error) => {
+            warn!(
+                session_id = %runtime.session_id,
+                error = %error,
+                "memory checkpoint extraction failed; skipping without aborting turn"
+            );
+        }
+    }
 }
 
 /// 执行一次模型请求，并在需要时只做一次 `context_length_exceeded` 兜底重试。
