@@ -4,8 +4,11 @@ build:
 test:
 	@cargo nextest run --all-features
 
-fmt:
+format:
 	@cargo +nightly fmt --all
+
+fmt-check:
+	@cargo +nightly fmt --all --check
 
 clippy:
 	@cargo clippy --all-targets --all-features -- -D warnings -W clippy::pedantic
@@ -16,7 +19,7 @@ audit:
 deny:
 	@cargo deny check
 
-check: build test fmt clippy audit deny
+check: build test fmt-check clippy audit deny
 
 release:
 	@cargo release tag --execute
@@ -28,4 +31,4 @@ release:
 update-submodule:
 	@git submodule update --init --recursive --remote
 
-.PHONY: build test fmt clippy audit deny check release update-submodule
+.PHONY: build test format fmt-check clippy audit deny check release update-submodule

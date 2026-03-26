@@ -10,7 +10,7 @@
 | 0006 | `0006_youyou_agent_design.md` | design | YouYou Agent - Architecture Design |
 | 0006-claude | `0006_youyou_agent_design_claude.md` | design | YouYou Agent - Architecture Design (by Claude) |
 | 0006-codex | `0006_youyou_agent_design_codex.md` | design | YouYou Agent - Architecture Design (by Codex) |
-| 0007 | `0007_youyou_agent_design_review_codex.md` | review | YouYou Agent Design Review by Codex |
-| 0007-claude | `0007_youyou_agent_design_review_claude.md` | review | YouYou Agent Architecture Design Review (by Claude) |
+| 0007 | `0007_youyou_agent_implement.md` | implement | YouYou Agent - Final Implementation Plan |
 | 0008 | `0008_youyou_agent_review.md` | review | YouYou Agent Implementation Review |
 | 0009 | `0009_youyou_agent_review.md` | review | YouYou Agent Implementation Review (Post-Fix) |
+| 0010 | `0010_youyou_agent_review.md` | review | YouYou Agent Implementation Review (Current State) |
