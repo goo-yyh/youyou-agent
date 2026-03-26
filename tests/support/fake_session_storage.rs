@@ -132,7 +132,7 @@ impl SessionStorage for FakeSessionStorage {
             .iter()
             .find(|payload| payload_matches(payload, &event.payload))
         {
-            return Err(anyhow!("simulated persistence failure for {:?}", payload));
+            return Err(anyhow!("simulated persistence failure for {payload:?}"));
         }
 
         state

@@ -203,12 +203,13 @@ impl MemoryManager {
         )?;
         let output = collect_model_output(provider, request, cancel).await?;
         let Some(extraction) = parse_extraction_result(&output) else {
-            warn!(
-                namespace = %namespace,
-                source = %source,
-                "memory extraction output is not valid JSON; treating as empty result",
-            );
-            return Ok(Some(last_seq));
+            return Err(AgentError::ProviderError {
+                message: "memory extraction output is not valid JSON".to_string(),
+                source: anyhow!(
+                    "memory extraction model returned invalid JSON for namespace '{namespace}' from source '{source}'"
+                ),
+                retryable: false,
+            });
         };
         let _ = (&extraction.rollout_summary, &extraction.rollout_slug);
 

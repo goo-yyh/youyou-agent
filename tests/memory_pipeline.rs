@@ -3,8 +3,9 @@ mod support;
 use chrono::{Duration, Utc};
 use tokio_stream::StreamExt;
 use youyou_agent::{
-    AgentBuilder, AgentConfig, ChatError, ChatEvent, ChatRequest, ContentBlock, Memory, Message,
-    ModelCapabilities, ModelInfo, RunningTurn, SessionConfig, TurnOutcome, UserInput,
+    AgentBuilder, AgentConfig, ChatError, ChatEvent, ChatRequest, ContentBlock, LedgerEventPayload,
+    Memory, Message, MetadataKey, ModelCapabilities, ModelInfo, RunningTurn, SessionConfig,
+    TurnOutcome, UserInput,
 };
 
 use crate::support::fake_memory_storage::{FakeMemoryStorage, RecordedSearch};
@@ -542,6 +543,155 @@ async fn close_extraction_failure_does_not_block_session_close() {
         .await
         .expect("slot should be released after close");
     assert!(!next_session.session_id().is_empty());
+}
+
+#[tokio::test]
+async fn close_extraction_timeout_does_not_block_session_close() {
+    let mut config = base_config("memory/test");
+    config.memory_checkpoint_interval = 100;
+    config.tool_timeout_ms = 25;
+
+    let memory_storage = FakeMemoryStorage::default();
+    let chat_provider = FakeProvider::new("chat-provider", vec![model_info("chat-model", 8_192)]);
+    let compact_provider =
+        FakeProvider::new("compact-provider", vec![model_info("compact-model", 8_192)]);
+    let memory_provider =
+        FakeProvider::new("memory-provider", vec![model_info("memory-model", 8_192)]);
+
+    chat_provider.enqueue_script(assistant_script("ok"));
+    memory_provider.enqueue_script(vec![FakeProviderStep::WaitForCancel]);
+
+    let agent = build_agent(
+        config,
+        chat_provider,
+        compact_provider,
+        memory_provider.clone(),
+        memory_storage,
+        None,
+    )
+    .await;
+    let session = agent
+        .new_session(SessionConfig::default())
+        .await
+        .expect("session should be created");
+
+    let outcome = finish_turn(
+        session
+            .send_message(text_input("hello"), None)
+            .await
+            .expect("turn should start"),
+    )
+    .await;
+    assert!(matches!(outcome, TurnOutcome::Completed));
+
+    let close_result =
+        tokio::time::timeout(std::time::Duration::from_millis(300), session.close()).await;
+    assert!(
+        close_result.is_ok(),
+        "close should finish before the outer timeout"
+    );
+    close_result
+        .expect("outer timeout should not fire")
+        .expect("close should succeed after internal extraction timeout");
+    assert_eq!(memory_provider.chat_calls(), 1);
+
+    let next_session = agent
+        .new_session(SessionConfig::default())
+        .await
+        .expect("slot should be released after timed-out close extraction");
+    assert!(!next_session.session_id().is_empty());
+}
+
+#[tokio::test]
+async fn invalid_memory_extraction_output_does_not_advance_checkpoint() {
+    let mut config = base_config("memory/test");
+    config.memory_checkpoint_interval = 1;
+
+    let memory_storage = FakeMemoryStorage::default();
+    let session_storage = FakeSessionStorage::default();
+    let chat_provider = FakeProvider::new("chat-provider", vec![model_info("chat-model", 8_192)]);
+    let compact_provider =
+        FakeProvider::new("compact-provider", vec![model_info("compact-model", 8_192)]);
+    let memory_provider =
+        FakeProvider::new("memory-provider", vec![model_info("memory-model", 8_192)]);
+
+    chat_provider.enqueue_script(assistant_script("first assistant"));
+    memory_provider.enqueue_script(assistant_script("not valid json"));
+    chat_provider.enqueue_script(assistant_script("second assistant"));
+    memory_provider.enqueue_script(empty_extraction_script());
+
+    let agent = build_agent(
+        config,
+        chat_provider,
+        compact_provider,
+        memory_provider.clone(),
+        memory_storage,
+        Some(session_storage.clone()),
+    )
+    .await;
+    let session = agent
+        .new_session(SessionConfig::default())
+        .await
+        .expect("session should be created");
+
+    let first_turn_input = "first turn";
+    let outcome = finish_turn(
+        session
+            .send_message(text_input(first_turn_input), None)
+            .await
+            .expect("first turn should start"),
+    )
+    .await;
+    assert!(matches!(outcome, TurnOutcome::Completed));
+
+    let saved_events = session_storage.saved_events(session.session_id());
+    assert!(
+        !saved_events.iter().any(|event| matches!(
+            event.payload,
+            LedgerEventPayload::Metadata {
+                key: MetadataKey::MemoryCheckpoint,
+                ..
+            }
+        )),
+        "invalid extraction output must not advance the checkpoint",
+    );
+
+    let second_turn_input = "second turn";
+    let outcome = finish_turn(
+        session
+            .send_message(text_input(second_turn_input), None)
+            .await
+            .expect("second turn should start"),
+    )
+    .await;
+    assert!(matches!(outcome, TurnOutcome::Completed));
+
+    let second_request = memory_provider
+        .requests()
+        .get(1)
+        .cloned()
+        .expect("second checkpoint request should exist");
+    let extraction_text = extraction_user_text(&second_request);
+
+    assert!(extraction_text.contains(first_turn_input));
+    assert!(extraction_text.contains("first assistant"));
+    assert!(extraction_text.contains(second_turn_input));
+    assert!(extraction_text.contains("second assistant"));
+
+    let checkpoint_count = session_storage
+        .saved_events(session.session_id())
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.payload,
+                LedgerEventPayload::Metadata {
+                    key: MetadataKey::MemoryCheckpoint,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(checkpoint_count, 1);
 }
 
 #[tokio::test]

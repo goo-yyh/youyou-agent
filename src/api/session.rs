@@ -176,11 +176,14 @@ impl SessionHandle {
             return Err(AgentError::SessionNotFound(self.session_id.clone()));
         }
 
-        if matches!(
-            active.turn_state,
-            crate::application::session_service::TurnState::Running(_)
-        ) {
-            return Err(AgentError::TurnBusy);
+        match &active.turn_state {
+            crate::application::session_service::TurnState::Running(_) => {
+                return Err(AgentError::TurnBusy);
+            }
+            crate::application::session_service::TurnState::Closing => {
+                return Err(AgentError::SessionBusy);
+            }
+            crate::application::session_service::TurnState::Idle => {}
         }
 
         let turn_cancel_token = active.session_cancel_token.child_token();
@@ -426,7 +429,12 @@ fn clear_running_turn(control: &Arc<Mutex<AgentControl>>, session_id: &str) {
         return;
     };
 
-    if active.session_id == session_id {
+    if active.session_id == session_id
+        && matches!(
+            active.turn_state,
+            crate::application::session_service::TurnState::Running(_)
+        )
+    {
         active.turn_state = crate::application::session_service::TurnState::Idle;
     }
 }

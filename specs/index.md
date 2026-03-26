@@ -12,3 +12,4 @@
 | 0006-codex | `0006_youyou_agent_design_codex.md` | design | YouYou Agent - Architecture Design (by Codex) |
 | 0007 | `0007_youyou_agent_design_review_codex.md` | review | YouYou Agent Design Review by Codex |
 | 0007-claude | `0007_youyou_agent_design_review_claude.md` | review | YouYou Agent Architecture Design Review (by Claude) |
+| 0008 | `0008_youyou_agent_review.md` | review | YouYou Agent Implementation Review |

@@ -295,11 +295,11 @@ impl EchoTool {
 
 #[async_trait]
 impl ToolHandler for EchoTool {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "echo"
     }
 
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "返回调用参数中的 value 字段"
     }
 

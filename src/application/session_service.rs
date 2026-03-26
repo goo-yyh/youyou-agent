@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use anyhow::anyhow;
 use chrono::Utc;
@@ -70,6 +71,8 @@ pub(crate) enum TurnState {
     Idle,
     /// 当前有一个正在运行的 turn。
     Running(RunningTurnHandle),
+    /// 当前 session 正在关闭，禁止启动新的 turn。
+    Closing,
 }
 
 /// 活跃 session 的控制面状态。
@@ -336,8 +339,7 @@ where
     ///
     /// 当句柄对应的会话已失效，或 `SessionEnd` hook 中止关闭时返回错误。
     pub(crate) async fn close_session(&self, session_id: &str) -> Result<()> {
-        let (runtime, session_cancel_token, running_turn) = self.take_close_target(session_id)?;
-        session_cancel_token.cancel();
+        let (runtime, running_turn) = self.begin_close(session_id)?;
 
         if let Some(mut turn_handle) = running_turn {
             turn_handle.turn_cancel_token.cancel();
@@ -354,7 +356,10 @@ where
                 None,
                 HookData::SessionEnd { message_count },
             )
-            .await?;
+            .await
+            .inspect_err(|_error| {
+                let _ = self.abort_close(session_id);
+            })?;
 
         self.run_close_memory_extraction(&runtime, session_id).await;
         self.finish_close(session_id)
@@ -619,20 +624,24 @@ where
             }
         };
         let source = format!("session:{session_id}");
+        let close_cancel = CancellationToken::new();
+        let close_timeout = Duration::from_millis(self.agent_config.tool_timeout_ms);
 
-        match memory_manager
-            .extract_incremental(IncrementalExtraction {
+        match tokio::time::timeout(
+            close_timeout,
+            memory_manager.extract_incremental(IncrementalExtraction {
                 namespace: &runtime.memory_namespace,
                 ledger: &runtime.ledger,
                 last_checkpoint_seq: runtime.last_memory_checkpoint_seq,
                 source: &source,
                 provider: provider.as_ref(),
                 model_id: &memory_model_id,
-                cancel: &CancellationToken::new(),
-            })
-            .await
+                cancel: &close_cancel,
+            }),
+        )
+        .await
         {
-            Ok(Some(last_seq)) => {
+            Ok(Ok(Some(last_seq))) => {
                 if let Err(error) = persist_memory_checkpoint_metadata(
                     &mut runtime,
                     self.session_storage.as_deref(),
@@ -647,12 +656,20 @@ where
                     );
                 }
             }
-            Ok(None) => {}
-            Err(error) => {
+            Ok(Ok(None) | Err(AgentError::RequestCancelled)) => {}
+            Ok(Err(error)) => {
                 warn!(
                     session_id = %session_id,
                     error = %error,
                     "memory close extraction failed; skipping without blocking close"
+                );
+            }
+            Err(_elapsed) => {
+                close_cancel.cancel();
+                warn!(
+                    session_id = %session_id,
+                    timeout_ms = self.agent_config.tool_timeout_ms,
+                    "memory close extraction timed out; skipping without blocking close"
                 );
             }
         }
@@ -789,15 +806,11 @@ where
         Ok(())
     }
 
-    /// 为 close 流程拿到目标会话。
-    fn take_close_target(
+    /// 将当前活跃 session 切换到 closing 状态，并返回 close 所需上下文。
+    fn begin_close(
         &self,
         session_id: &str,
-    ) -> Result<(
-        Arc<AsyncMutex<SessionRuntime>>,
-        CancellationToken,
-        Option<RunningTurnHandle>,
-    )> {
+    ) -> Result<(Arc<AsyncMutex<SessionRuntime>>, Option<RunningTurnHandle>)> {
         let mut control = self.lock_control()?;
         let SessionSlotState::Active(active) = &mut control.slot else {
             return Err(AgentError::SessionNotFound(session_id.to_string()));
@@ -808,22 +821,46 @@ where
         }
 
         let runtime = Arc::clone(&active.runtime);
-        let session_cancel_token = active.session_cancel_token.clone();
-        let running_turn = match std::mem::replace(&mut active.turn_state, TurnState::Idle) {
+        let running_turn = match std::mem::replace(&mut active.turn_state, TurnState::Closing) {
             TurnState::Idle => None,
             TurnState::Running(handle) => Some(handle),
+            TurnState::Closing => return Err(AgentError::SessionBusy),
         };
 
-        Ok((runtime, session_cancel_token, running_turn))
+        Ok((runtime, running_turn))
+    }
+
+    /// 在 close 流程被 hook 中止后恢复 session 的可运行状态。
+    fn abort_close(&self, session_id: &str) -> Result<()> {
+        let mut control = self.lock_control()?;
+        let SessionSlotState::Active(active) = &mut control.slot else {
+            return Err(AgentError::SessionNotFound(session_id.to_string()));
+        };
+
+        if active.session_id != session_id {
+            return Err(AgentError::SessionNotFound(session_id.to_string()));
+        }
+
+        if matches!(active.turn_state, TurnState::Closing) {
+            active.turn_state = TurnState::Idle;
+        }
+
+        Ok(())
     }
 
     /// close 成功后提交槽位释放。
     fn finish_close(&self, session_id: &str) -> Result<()> {
         let mut control = self.lock_control()?;
         match &control.slot {
-            SessionSlotState::Active(active) if active.session_id == session_id => {
+            SessionSlotState::Active(active)
+                if active.session_id == session_id
+                    && matches!(active.turn_state, TurnState::Closing) =>
+            {
                 control.slot = SessionSlotState::Empty;
                 Ok(())
+            }
+            SessionSlotState::Active(active) if active.session_id == session_id => {
+                Err(AgentError::SessionBusy)
             }
             _ => Err(AgentError::SessionNotFound(session_id.to_string())),
         }

@@ -326,6 +326,48 @@ async fn session_start_abort_does_not_leak_reserved_slot() {
 }
 
 #[tokio::test]
+async fn session_end_abort_does_not_poison_active_session() {
+    let provider = FakeProvider::new("provider-a", vec![model_info("chat-model", 8_192)]);
+    provider.enqueue_script(assistant_script("still alive after failed close"));
+    let (plugin, _handle) = FakePlugin::new(
+        plugin_descriptor("abort-on-end", vec![HookEvent::SessionEnd]),
+        None,
+        None,
+        FakePluginApplyBehavior::RegisterDeclaredAbort(
+            HookEvent::SessionEnd,
+            "blocked by plugin".to_string(),
+        ),
+    );
+
+    let agent = AgentBuilder::new(base_config("chat-model"))
+        .register_model_provider(provider)
+        .register_plugin(plugin, json!({"enabled": true}))
+        .build()
+        .await
+        .expect("agent should build");
+    let session = agent
+        .new_session(SessionConfig::default())
+        .await
+        .expect("session should be created");
+
+    let close = session.close().await;
+    assert!(matches!(
+        close,
+        Err(AgentError::PluginAborted { hook, reason })
+            if hook == "SessionEnd" && reason == "blocked by plugin"
+    ));
+
+    let outcome = finish_turn(
+        session
+            .send_message(text_input("session should still be usable"), None)
+            .await
+            .expect("turn should still start after failed close"),
+    )
+    .await;
+    assert!(matches!(outcome, TurnOutcome::Completed));
+}
+
+#[tokio::test]
 async fn summary_compaction_resume_is_consistent_end_to_end() {
     let mut config = base_config("chat-model");
     config.compact_model = Some("compact-model".to_string());
