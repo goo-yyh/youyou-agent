@@ -15,6 +15,7 @@ use crate::application::tool_dispatcher::ToolDispatcher;
 use crate::application::turn_engine::{self, TurnEngineDeps};
 use crate::domain::{AgentError, ContentBlock, Message, Result, UserInput};
 use crate::ports::ModelCapabilities;
+use crate::prompt::templates::DEFAULT_COMPACT_PROMPT;
 
 use super::agent::{AgentKernel, ModelRegistry};
 
@@ -200,26 +201,29 @@ impl SessionHandle {
         &self,
         model_capabilities: ModelCapabilities,
     ) -> Result<TurnEngineDeps> {
-        let registered_model = self.kernel.models.resolve_model(&self.model_id)?;
-        let provider = self
+        let provider = self.resolve_provider_for_model(&self.model_id)?;
+        let compact_model_id = self
             .kernel
-            .models
-            .providers
-            .get(&registered_model.provider_id)
-            .cloned()
-            .ok_or_else(|| AgentError::ProviderError {
-                message: format!(
-                    "provider '{}' for model '{}' is not registered",
-                    registered_model.provider_id, self.model_id
-                ),
-                source: anyhow!("model provider missing from registry"),
-                retryable: false,
-            })?;
+            .config
+            .compact_model
+            .clone()
+            .unwrap_or_else(|| self.model_id.clone());
+        let compact_registered_model = self.kernel.models.resolve_model(&compact_model_id)?;
+        let compact_provider = self.resolve_provider_for_model(&compact_model_id)?;
 
         Ok(TurnEngineDeps {
             agent_config: self.kernel.config.clone(),
             provider,
             model_capabilities,
+            compact_provider,
+            compact_model_id,
+            compact_model_capabilities: compact_registered_model.info.capabilities,
+            compact_prompt: self
+                .kernel
+                .config
+                .compact_prompt
+                .clone()
+                .unwrap_or_else(|| DEFAULT_COMPACT_PROMPT.to_string()),
             plugins: self.kernel.plugins.values().cloned().collect(),
             implicit_skills: self
                 .kernel
@@ -239,6 +243,28 @@ impl SessionHandle {
             hook_registry: self.kernel.hook_registry.clone(),
             session_storage: self.kernel.session_storage.clone(),
         })
+    }
+
+    /// 为指定模型解析其所属的 provider。
+    fn resolve_provider_for_model(
+        &self,
+        model_id: &str,
+    ) -> Result<std::sync::Arc<dyn crate::ports::ModelProvider>> {
+        let registered_model = self.kernel.models.resolve_model(model_id)?;
+
+        self.kernel
+            .models
+            .providers
+            .get(&registered_model.provider_id)
+            .cloned()
+            .ok_or_else(|| AgentError::ProviderError {
+                message: format!(
+                    "provider '{}' for model '{}' is not registered",
+                    registered_model.provider_id, model_id
+                ),
+                source: anyhow!("model provider missing from registry"),
+                retryable: false,
+            })
     }
 }
 

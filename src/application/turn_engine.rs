@@ -6,15 +6,16 @@ use anyhow::anyhow;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use crate::application::prompt_builder::{PromptBuildContext, PromptBuilder};
+use crate::application::prompt_builder::{PromptBuildContext, PromptBuilder, RenderedPrompt};
 use crate::application::request_builder::{
-    ChatRequestBuilder, RequestBuildOptions, RequestContext, ResolvedSessionConfig,
+    ChatRequestBuilder, RequestBuildOptions, ResolvedSessionConfig,
 };
 use crate::application::session_service::{SessionRuntime, persist_and_project};
 use crate::application::tool_dispatcher::{RequestedToolCall, ToolDispatcher};
 use crate::domain::{
     AgentConfig, AgentError, AgentEvent, AgentEventPayload, ContentBlock, HookData, HookPatch,
-    LedgerEventPayload, Message, MessageStatus, Result, SkillDefinition, TurnOutcome, UserInput,
+    LedgerEventPayload, Message, MessageStatus, MetadataKey, Result, SkillDefinition, TurnOutcome,
+    UserInput,
 };
 use crate::ports::{
     ChatEvent, ModelCapabilities, ModelProvider, PluginDescriptor, SessionStorage, ToolDefinition,
@@ -24,10 +25,18 @@ use crate::ports::{
 pub(crate) struct TurnEngineDeps {
     /// Agent 全局配置快照。
     pub(crate) agent_config: AgentConfig,
-    /// 当前 turn 使用的 provider。
+    /// 当前 turn 使用的主 provider。
     pub(crate) provider: Arc<dyn ModelProvider>,
     /// 当前模型能力声明。
     pub(crate) model_capabilities: ModelCapabilities,
+    /// compact 使用的 provider。
+    pub(crate) compact_provider: Arc<dyn ModelProvider>,
+    /// compact 使用的模型标识。
+    pub(crate) compact_model_id: String,
+    /// compact 模型能力声明。
+    pub(crate) compact_model_capabilities: ModelCapabilities,
+    /// compact 使用的 prompt 文本。
+    pub(crate) compact_prompt: String,
     /// 当前会话激活的 plugin 描述。
     pub(crate) plugins: Vec<PluginDescriptor>,
     /// 允许隐式展示的 skill 列表。
@@ -51,6 +60,33 @@ struct ModelIteration {
     tool_calls: Vec<RequestedToolCall>,
     /// 本次模型请求是否因为取消结束。
     cancelled: bool,
+}
+
+/// 模型请求阶段的错误分类。
+#[derive(Debug)]
+enum RequestIterationError {
+    /// 常规 Agent 错误。
+    Agent(AgentError),
+    /// Provider 明确报告上下文窗口超限。
+    ContextLengthExceeded(String),
+}
+
+/// compact 的触发来源。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompactionTrigger {
+    /// 在请求前根据估算主动触发。
+    Estimate,
+    /// Provider 返回 `context_length_exceeded` 后兜底触发。
+    ContextLengthExceededFallback,
+}
+
+/// 本次 compact 编排的处理结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompactionOutcome {
+    /// 成功执行并持久化了 compact marker。
+    Applied,
+    /// 本次 compact 被 `BeforeCompact` 中止，仅对预估触发有效。
+    Skipped,
 }
 
 /// 运行中 turn 的额外终态控制。
@@ -91,7 +127,7 @@ pub(crate) async fn run_turn(
 /// 执行单轮 turn 的完整编排流程。
 #[allow(
     clippy::too_many_lines,
-    reason = "phase 5 的主循环需要把 provider、tool loop、取消和终态统一编排在一起。"
+    reason = "turn loop 需要把 provider、compact、tool loop 和取消语义放在同一个状态机里。"
 )]
 async fn run_turn_inner(
     runtime: Arc<AsyncMutex<SessionRuntime>>,
@@ -119,16 +155,70 @@ async fn run_turn_inner(
     let mut continuation = TurnContinuation::Continue;
 
     loop {
-        let iteration = request_model_iteration(
+        if cancel.is_cancelled() {
+            return finalize_cancelled_turn(
+                &mut runtime,
+                &deps.hook_registry,
+                &event_tx,
+                &turn_id,
+                String::new(),
+                tool_calls_count,
+            )
+            .await;
+        }
+
+        let prompt = build_turn_prompt(&deps, &runtime, &dynamic_sections);
+        match maybe_compact_before_request(
             &mut runtime,
             &deps,
-            &dynamic_sections,
+            &event_tx,
+            &turn_id,
+            &cancel,
+            &prompt,
+            allow_tools,
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(AgentError::RequestCancelled) => {
+                return finalize_cancelled_turn(
+                    &mut runtime,
+                    &deps.hook_registry,
+                    &event_tx,
+                    &turn_id,
+                    String::new(),
+                    tool_calls_count,
+                )
+                .await;
+            }
+            Err(error) => return Err(error),
+        }
+
+        let iteration = match request_model_iteration_with_fallback(
+            &mut runtime,
+            &deps,
+            &prompt,
             &event_tx,
             &turn_id,
             &cancel,
             allow_tools,
         )
-        .await?;
+        .await
+        {
+            Ok(iteration) => iteration,
+            Err(AgentError::RequestCancelled) => {
+                return finalize_cancelled_turn(
+                    &mut runtime,
+                    &deps.hook_registry,
+                    &event_tx,
+                    &turn_id,
+                    String::new(),
+                    tool_calls_count,
+                )
+                .await;
+            }
+            Err(error) => return Err(error),
+        };
 
         if iteration.cancelled {
             if !iteration.assistant_output.is_empty() {
@@ -278,61 +368,14 @@ async fn dispatch_turn_start(
     Ok(collect_dynamic_sections(patch))
 }
 
-/// 将显式触发的 skill 注入记到账本。
-async fn persist_skill_injections(
-    runtime: &mut SessionRuntime,
-    storage: Option<&dyn SessionStorage>,
-    skill_injections: &[Message],
-) -> Result<()> {
-    for message in skill_injections {
-        if let Message::System { content } = message {
-            persist_and_project(
-                runtime,
-                storage,
-                LedgerEventPayload::SystemMessage {
-                    content: content.clone(),
-                },
-            )
-            .await?;
-        }
-    }
-
-    Ok(())
-}
-
-/// 将用户输入写入账本与上下文投影。
-async fn persist_user_message(
-    runtime: &mut SessionRuntime,
-    storage: Option<&dyn SessionStorage>,
-    input: &UserInput,
-) -> Result<()> {
-    persist_and_project(
-        runtime,
-        storage,
-        LedgerEventPayload::UserMessage {
-            content: input.content.clone(),
-        },
-    )
-    .await?;
-
-    Ok(())
-}
-
-/// 发起单次模型请求迭代。
-#[allow(
-    clippy::too_many_arguments,
-    reason = "单次模型请求需要显式接收 prompt、事件和取消上下文。"
-)]
-async fn request_model_iteration(
-    runtime: &mut SessionRuntime,
+/// 构造当前迭代的 system prompt。
+#[must_use]
+fn build_turn_prompt(
     deps: &TurnEngineDeps,
+    runtime: &SessionRuntime,
     dynamic_sections: &[String],
-    event_tx: &mpsc::Sender<AgentEvent>,
-    turn_id: &str,
-    cancel: &CancellationToken,
-    allow_tools: bool,
-) -> Result<ModelIteration> {
-    let prompt = PromptBuilder::new().build(
+) -> RenderedPrompt {
+    PromptBuilder::new().build(
         &deps.agent_config,
         runtime.system_prompt_override.as_deref(),
         &PromptBuildContext {
@@ -341,20 +384,134 @@ async fn request_model_iteration(
             memories: runtime.bootstrap_memories.clone(),
             dynamic_sections: dynamic_sections.to_vec(),
         },
-    );
-    let request = ChatRequestBuilder::new().build(
-        &prompt,
-        &RequestContext {
-            messages: runtime.context_manager.visible_messages().to_vec(),
-            model_capabilities: deps.model_capabilities,
-            tool_definitions: deps.tool_definitions.clone(),
-        },
-        &ResolvedSessionConfig {
-            model_id: runtime.model_id.clone(),
-            system_prompt_override: runtime.system_prompt_override.clone(),
-        },
-        &RequestBuildOptions { allow_tools },
-    )?;
+    )
+}
+
+/// 在请求前根据估算决定是否主动 compact。
+async fn maybe_compact_before_request(
+    runtime: &mut SessionRuntime,
+    deps: &TurnEngineDeps,
+    event_tx: &mpsc::Sender<AgentEvent>,
+    turn_id: &str,
+    cancel: &CancellationToken,
+    prompt: &RenderedPrompt,
+    allow_tools: bool,
+) -> Result<()> {
+    let tools_chars = if allow_tools {
+        tool_definitions_chars(&deps.tool_definitions)
+    } else {
+        0
+    };
+
+    if !runtime
+        .context_manager
+        .needs_compaction(prompt.text.len(), tools_chars)
+    {
+        return Ok(());
+    }
+
+    let _ = compact_context(
+        runtime,
+        deps,
+        event_tx,
+        turn_id,
+        cancel,
+        CompactionTrigger::Estimate,
+    )
+    .await?;
+    Ok(())
+}
+
+/// 执行一次模型请求，并在需要时只做一次 `context_length_exceeded` 兜底重试。
+async fn request_model_iteration_with_fallback(
+    runtime: &mut SessionRuntime,
+    deps: &TurnEngineDeps,
+    prompt: &RenderedPrompt,
+    event_tx: &mpsc::Sender<AgentEvent>,
+    turn_id: &str,
+    cancel: &CancellationToken,
+    allow_tools: bool,
+) -> Result<ModelIteration> {
+    match request_model_iteration_once(
+        runtime,
+        deps,
+        prompt,
+        event_tx,
+        turn_id,
+        cancel,
+        allow_tools,
+    )
+    .await
+    {
+        Ok(iteration) => Ok(iteration),
+        Err(RequestIterationError::Agent(error)) => Err(error),
+        Err(RequestIterationError::ContextLengthExceeded(message)) => {
+            let _ = compact_context(
+                runtime,
+                deps,
+                event_tx,
+                turn_id,
+                cancel,
+                CompactionTrigger::ContextLengthExceededFallback,
+            )
+            .await?;
+
+            match request_model_iteration_once(
+                runtime,
+                deps,
+                prompt,
+                event_tx,
+                turn_id,
+                cancel,
+                allow_tools,
+            )
+            .await
+            {
+                Ok(iteration) => Ok(iteration),
+                Err(RequestIterationError::Agent(error)) => Err(error),
+                Err(RequestIterationError::ContextLengthExceeded(retry_message)) => {
+                    Err(AgentError::CompactError {
+                        message: format!(
+                            "provider still rejected the request after fallback compaction: {message}; retry: {retry_message}"
+                        ),
+                    })
+                }
+            }
+        }
+    }
+}
+
+/// 发起单次模型请求迭代。
+async fn request_model_iteration_once(
+    runtime: &mut SessionRuntime,
+    deps: &TurnEngineDeps,
+    prompt: &RenderedPrompt,
+    event_tx: &mpsc::Sender<AgentEvent>,
+    turn_id: &str,
+    cancel: &CancellationToken,
+    allow_tools: bool,
+) -> std::result::Result<ModelIteration, RequestIterationError> {
+    if cancel.is_cancelled() {
+        return Ok(ModelIteration {
+            assistant_output: String::new(),
+            tool_calls: Vec::new(),
+            cancelled: true,
+        });
+    }
+
+    let request = ChatRequestBuilder::new()
+        .build(
+            prompt,
+            &runtime
+                .context_manager
+                .build_request_context(deps.model_capabilities, deps.tool_definitions.clone()),
+            &ResolvedSessionConfig {
+                model_id: runtime.model_id.clone(),
+                system_prompt_override: runtime.system_prompt_override.clone(),
+            },
+            &RequestBuildOptions { allow_tools },
+        )
+        .map_err(RequestIterationError::Agent)?;
     let stream = match deps.provider.chat(request, cancel.clone()).await {
         Ok(stream) => stream,
         Err(_error) if cancel.is_cancelled() => {
@@ -365,11 +522,11 @@ async fn request_model_iteration(
             });
         }
         Err(error) => {
-            return Err(AgentError::ProviderError {
+            return Err(RequestIterationError::Agent(AgentError::ProviderError {
                 message: "failed to start provider chat request".to_string(),
                 source: error.context("model provider failed to start chat request"),
                 retryable: false,
-            });
+            }));
         }
     };
 
@@ -379,7 +536,7 @@ async fn request_model_iteration(
 /// 消费 provider 流，收集 assistant 输出和 `ToolCall`。
 #[allow(
     clippy::too_many_lines,
-    reason = "provider 流消费需要同时处理文本增量、tool call、取消和 provider error。"
+    reason = "provider 流需要同时处理文本增量、tool call、取消和上下文超限分支。"
 )]
 async fn consume_provider_stream(
     runtime: &mut SessionRuntime,
@@ -388,7 +545,7 @@ async fn consume_provider_stream(
     cancel: &CancellationToken,
     mut stream: crate::ports::ChatEventStream,
     allow_tools: bool,
-) -> Result<ModelIteration> {
+) -> std::result::Result<ModelIteration, RequestIterationError> {
     use futures::StreamExt;
 
     let mut assistant_output = String::new();
@@ -406,11 +563,11 @@ async fn consume_provider_stream(
                 });
             }
             Err(error) => {
-                return Err(AgentError::ProviderError {
+                return Err(RequestIterationError::Agent(AgentError::ProviderError {
                     message: "provider stream failed".to_string(),
                     source: error.context("model provider stream returned an error"),
                     retryable: false,
-                });
+                }));
             }
         };
 
@@ -440,12 +597,12 @@ async fn consume_provider_stream(
                 arguments,
             } => {
                 if !allow_tools {
-                    return Err(AgentError::ProviderError {
+                    return Err(RequestIterationError::Agent(AgentError::ProviderError {
                         message: "provider emitted a tool call after tools were disabled"
                             .to_string(),
                         source: anyhow!("provider emitted tool call in final no-tools request"),
                         retryable: false,
-                    });
+                    }));
                 }
                 tool_calls.push(RequestedToolCall {
                     call_id,
@@ -464,13 +621,16 @@ async fn consume_provider_stream(
                     cancelled: true,
                 });
             }
+            ChatEvent::Error(error) if error.is_context_length_exceeded => {
+                return Err(RequestIterationError::ContextLengthExceeded(error.message));
+            }
             ChatEvent::Error(error) => {
                 let retryable = error.retryable;
-                return Err(AgentError::ProviderError {
+                return Err(RequestIterationError::Agent(AgentError::ProviderError {
                     message: error.message.clone(),
                     source: anyhow!(error),
                     retryable,
-                });
+                }));
             }
         }
     }
@@ -491,11 +651,166 @@ async fn consume_provider_stream(
         });
     }
 
-    Err(AgentError::ProviderError {
+    Err(RequestIterationError::Agent(AgentError::ProviderError {
         message: "provider stream ended before completion".to_string(),
         source: anyhow!("provider stream ended without a done event"),
         retryable: false,
-    })
+    }))
+}
+
+/// 执行一次完整的 compact 编排。
+async fn compact_context(
+    runtime: &mut SessionRuntime,
+    deps: &TurnEngineDeps,
+    event_tx: &mpsc::Sender<AgentEvent>,
+    turn_id: &str,
+    cancel: &CancellationToken,
+    trigger: CompactionTrigger,
+) -> Result<CompactionOutcome> {
+    match dispatch_before_compact(
+        &deps.hook_registry,
+        &runtime.session_id,
+        turn_id,
+        runtime.context_manager.visible_messages().len(),
+        runtime.context_manager.estimated_tokens(),
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(AgentError::PluginAborted {
+            hook: "BeforeCompact",
+            reason,
+        }) => {
+            return match trigger {
+                CompactionTrigger::Estimate => Ok(CompactionOutcome::Skipped),
+                CompactionTrigger::ContextLengthExceededFallback => Err(AgentError::CompactError {
+                    message: format!("BeforeCompact hook aborted fallback compaction: {reason}"),
+                }),
+            };
+        }
+        Err(error) => return Err(error),
+    }
+
+    let marker = runtime
+        .context_manager
+        .generate_compaction_marker(
+            &runtime.ledger,
+            deps.compact_provider.as_ref(),
+            &deps.compact_model_id,
+            deps.compact_model_capabilities,
+            &deps.compact_prompt,
+            cancel,
+        )
+        .await?;
+    persist_compaction_marker(runtime, deps.session_storage.as_deref(), marker).await?;
+    emit_event(
+        runtime,
+        event_tx,
+        turn_id,
+        AgentEventPayload::ContextCompacted,
+    )
+    .await;
+
+    Ok(CompactionOutcome::Applied)
+}
+
+/// 触发 `BeforeCompact` hook。
+async fn dispatch_before_compact(
+    hook_registry: &crate::application::hook_registry::HookRegistry,
+    session_id: &str,
+    turn_id: &str,
+    message_count: usize,
+    estimated_tokens: usize,
+) -> Result<()> {
+    let _ = hook_registry
+        .dispatch(
+            crate::domain::HookEvent::BeforeCompact,
+            session_id,
+            Some(turn_id),
+            HookData::BeforeCompact {
+                message_count,
+                estimated_tokens,
+            },
+        )
+        .await?;
+
+    Ok(())
+}
+
+/// 将 compact marker 作为关键 metadata 持久化到账本。
+async fn persist_compaction_marker(
+    runtime: &mut SessionRuntime,
+    storage: Option<&dyn SessionStorage>,
+    marker: crate::domain::CompactionMarker,
+) -> Result<()> {
+    let value = serde_json::to_value(&marker).map_err(|error| {
+        AgentError::StorageError(anyhow!(error).context("failed to serialize compact marker"))
+    })?;
+
+    let _ = persist_and_project(
+        runtime,
+        storage,
+        LedgerEventPayload::Metadata {
+            key: MetadataKey::ContextCompaction,
+            value,
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// 计算当前请求中 tool 定义的大致字符数。
+#[must_use]
+fn tool_definitions_chars(definitions: &[ToolDefinition]) -> usize {
+    definitions
+        .iter()
+        .map(|definition| {
+            definition.name.len()
+                + definition.description.len()
+                + definition.parameters.to_string().len()
+        })
+        .sum()
+}
+
+/// 将显式触发的 skill 注入记到账本。
+async fn persist_skill_injections(
+    runtime: &mut SessionRuntime,
+    storage: Option<&dyn SessionStorage>,
+    skill_injections: &[Message],
+) -> Result<()> {
+    for message in skill_injections {
+        if let Message::System { content } = message {
+            let _ = persist_and_project(
+                runtime,
+                storage,
+                LedgerEventPayload::SystemMessage {
+                    content: content.clone(),
+                },
+            )
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// 将用户输入写入账本与上下文投影。
+async fn persist_user_message(
+    runtime: &mut SessionRuntime,
+    storage: Option<&dyn SessionStorage>,
+    input: &UserInput,
+) -> Result<()> {
+    let _ = persist_and_project(
+        runtime,
+        storage,
+        LedgerEventPayload::UserMessage {
+            content: input.content.clone(),
+        },
+    )
+    .await?;
+
+    Ok(())
 }
 
 /// 将当前批次的 `ToolCall` 写入账本。
@@ -505,7 +820,7 @@ async fn persist_tool_calls(
     batch: &crate::application::tool_dispatcher::PreparedToolBatch,
 ) -> Result<()> {
     for call in &batch.calls {
-        persist_and_project(
+        let _ = persist_and_project(
             runtime,
             storage,
             LedgerEventPayload::ToolCall {
@@ -527,7 +842,7 @@ async fn persist_tool_results(
     results: &[crate::application::tool_dispatcher::ToolExecutionRecord],
 ) -> Result<()> {
     for result in results {
-        persist_and_project(
+        let _ = persist_and_project(
             runtime,
             storage,
             LedgerEventPayload::ToolResult {
@@ -547,7 +862,7 @@ async fn persist_tool_limit_message(
     storage: Option<&dyn SessionStorage>,
     limit: usize,
 ) -> Result<()> {
-    persist_and_project(
+    let _ = persist_and_project(
         runtime,
         storage,
         LedgerEventPayload::SystemMessage {
@@ -572,7 +887,7 @@ async fn persist_assistant_message(
         return Ok(());
     }
 
-    persist_and_project(
+    let _ = persist_and_project(
         runtime,
         storage,
         LedgerEventPayload::AssistantMessage {
@@ -646,7 +961,7 @@ async fn dispatch_turn_end(
     tool_calls_count: usize,
     cancelled: bool,
 ) -> Result<()> {
-    hook_registry
+    let _ = hook_registry
         .dispatch(
             crate::domain::HookEvent::TurnEnd,
             session_id,
@@ -681,6 +996,7 @@ async fn emit_event(
 }
 
 /// 从 `TurnStart` patch 中提取动态段落。
+#[must_use]
 fn collect_dynamic_sections(patch: Option<HookPatch>) -> Vec<String> {
     match patch {
         Some(HookPatch::TurnStart {
@@ -694,6 +1010,7 @@ fn collect_dynamic_sections(patch: Option<HookPatch>) -> Vec<String> {
 }
 
 /// 将 assistant 文本封装为标准内容块。
+#[must_use]
 fn assistant_content(text: &str) -> Vec<ContentBlock> {
     vec![ContentBlock::Text(text.to_string())]
 }
