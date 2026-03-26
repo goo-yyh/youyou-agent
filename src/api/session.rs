@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 use crate::api::RunningTurn;
 use crate::application::session_service::{AgentControl, SessionDescriptor, SessionService};
 use crate::application::skill_manager::SkillManager;
+use crate::application::tool_dispatcher::ToolDispatcher;
 use crate::application::turn_engine::{self, TurnEngineDeps};
 use crate::domain::{AgentError, ContentBlock, Message, Result, UserInput};
 use crate::ports::ModelCapabilities;
@@ -228,6 +229,13 @@ impl SessionHandle {
                 .filter(|skill| skill.allow_implicit_invocation)
                 .cloned()
                 .collect(),
+            tool_definitions: self.kernel.tools.definitions.values().cloned().collect(),
+            tool_dispatcher: ToolDispatcher::new(
+                self.kernel.tools.handlers.clone(),
+                self.kernel.config.tool_timeout_ms,
+                self.kernel.config.tool_output_max_bytes,
+                self.kernel.config.tool_output_metadata_max_bytes,
+            ),
             hook_registry: self.kernel.hook_registry.clone(),
             session_storage: self.kernel.session_storage.clone(),
         })

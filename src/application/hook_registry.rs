@@ -76,20 +76,22 @@ impl HookRegistry {
         session_id: &str,
         turn_id: Option<&str>,
         data: HookData,
-    ) -> Result<Vec<HookPatch>> {
-        let mut patches = Vec::new();
+    ) -> Result<Option<HookPatch>> {
         let Some(registrations) = self.handlers.get(&event) else {
-            return Ok(patches);
+            return Ok(None);
         };
 
         let timestamp = Utc::now();
+        let mut working_data = data;
+        let mut accumulated_patch = None;
+
         for registration in registrations {
             let payload = HookPayload {
                 event: event.clone(),
                 session_id: session_id.to_string(),
                 turn_id: turn_id.map(str::to_string),
                 plugin_config: registration.plugin_config.clone(),
-                data: data.clone(),
+                data: working_data.clone(),
                 timestamp,
             };
 
@@ -105,7 +107,8 @@ impl HookRegistry {
                             ),
                         });
                     }
-                    patches.push(patch);
+                    working_data = apply_patch_to_data(working_data, &patch);
+                    accumulated_patch = Some(merge_patch(accumulated_patch, patch));
                 }
                 crate::domain::HookResult::Abort(reason) => {
                     return Err(AgentError::PluginAborted {
@@ -116,6 +119,75 @@ impl HookRegistry {
             }
         }
 
-        Ok(patches)
+        Ok(accumulated_patch)
+    }
+}
+
+/// 将 patch 立即应用到工作副本，供后续 handler 观察前序修改。
+fn apply_patch_to_data(data: HookData, patch: &HookPatch) -> HookData {
+    match (data, patch) {
+        (
+            HookData::TurnStart {
+                user_input,
+                mut dynamic_sections,
+            },
+            HookPatch::TurnStart {
+                append_dynamic_sections,
+            },
+        ) => {
+            dynamic_sections.extend(
+                append_dynamic_sections
+                    .iter()
+                    .filter(|section| !section.trim().is_empty())
+                    .cloned(),
+            );
+            HookData::TurnStart {
+                user_input,
+                dynamic_sections,
+            }
+        }
+        (HookData::BeforeToolUse { tool_name, .. }, HookPatch::BeforeToolUse { arguments }) => {
+            HookData::BeforeToolUse {
+                tool_name,
+                arguments: arguments.clone(),
+            }
+        }
+        (data, _) => data,
+    }
+}
+
+/// 按事件定义的规则合并多次 patch。
+fn merge_patch(existing: Option<HookPatch>, patch: HookPatch) -> HookPatch {
+    match (existing, patch) {
+        (
+            Some(HookPatch::TurnStart {
+                mut append_dynamic_sections,
+            }),
+            HookPatch::TurnStart {
+                append_dynamic_sections: incoming_sections,
+            },
+        ) => {
+            append_dynamic_sections.extend(
+                incoming_sections
+                    .into_iter()
+                    .filter(|section| !section.trim().is_empty()),
+            );
+            HookPatch::TurnStart {
+                append_dynamic_sections,
+            }
+        }
+        (_, HookPatch::BeforeToolUse { arguments }) => HookPatch::BeforeToolUse { arguments },
+        (
+            None,
+            HookPatch::TurnStart {
+                append_dynamic_sections,
+            },
+        ) => HookPatch::TurnStart {
+            append_dynamic_sections: append_dynamic_sections
+                .into_iter()
+                .filter(|section| !section.trim().is_empty())
+                .collect(),
+        },
+        (Some(patch), _) => patch,
     }
 }

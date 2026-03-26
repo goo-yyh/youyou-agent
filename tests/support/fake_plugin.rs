@@ -19,6 +19,8 @@ pub enum FakePluginApplyBehavior {
     RegisterDeclared(HookEvent),
     /// 注册一个已声明的 hook，并在触发时返回中止结果。
     RegisterDeclaredAbort(HookEvent, String),
+    /// 注册一个已声明的 hook，并返回给定结果。
+    RegisterDeclaredResult(HookEvent, HookResult),
     /// 尝试注册一个未声明的 hook。
     RegisterUndeclared(HookEvent),
 }
@@ -120,6 +122,7 @@ impl Plugin for FakePlugin {
             FakePluginApplyBehavior::Noop => return,
             FakePluginApplyBehavior::RegisterDeclared(event)
             | FakePluginApplyBehavior::RegisterDeclaredAbort(event, _)
+            | FakePluginApplyBehavior::RegisterDeclaredResult(event, _)
             | FakePluginApplyBehavior::RegisterUndeclared(event) => event.clone(),
         };
 
@@ -127,6 +130,7 @@ impl Plugin for FakePlugin {
             FakePluginApplyBehavior::RegisterDeclaredAbort(_, reason) => {
                 HookResult::Abort(reason.clone())
             }
+            FakePluginApplyBehavior::RegisterDeclaredResult(_, hook_result) => hook_result.clone(),
             FakePluginApplyBehavior::Noop
             | FakePluginApplyBehavior::RegisterDeclared(_)
             | FakePluginApplyBehavior::RegisterUndeclared(_) => HookResult::Continue,

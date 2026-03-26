@@ -4,38 +4,18 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use indexmap::IndexMap;
-use tracing::warn;
-
 use crate::api::agent::{
     Agent, AgentKernel, ModelRegistry, RegisteredModel, SkillRegistry, ToolRegistry,
 };
-use crate::application::hook_registry::HookRegistry;
+use crate::application::plugin_manager::{ConfiguredPlugin, PluginManager};
 use crate::domain::{AgentConfig, AgentError, Result, SkillDefinition};
 use crate::ports::{
-    MemoryStorage, ModelProvider, Plugin, PluginContext, SessionStorage, ToolDefinition,
-    ToolHandler,
+    MemoryStorage, ModelProvider, Plugin, SessionStorage, ToolDefinition, ToolHandler,
 };
 
 #[derive(Debug, Clone, Copy, Default)]
 struct StorageRegistration {
     count: usize,
-}
-
-#[derive(Clone)]
-struct RegisteredPlugin {
-    instance: Arc<dyn Plugin>,
-    config: serde_json::Value,
-}
-
-impl fmt::Debug for RegisteredPlugin {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("RegisteredPlugin")
-            .field("descriptor", &self.instance.descriptor())
-            .field("config", &self.config)
-            .finish()
-    }
 }
 
 /// 在尚未注册任何模型提供方之前使用的标记类型。
@@ -52,7 +32,7 @@ pub struct AgentBuilder<S = NoProvider> {
     providers: Vec<Arc<dyn ModelProvider>>,
     tools: Vec<Arc<dyn ToolHandler>>,
     skills: Vec<SkillDefinition>,
-    plugins: Vec<RegisteredPlugin>,
+    plugins: Vec<ConfiguredPlugin>,
     session_storage: Option<Arc<dyn SessionStorage>>,
     memory_storage: Option<Arc<dyn MemoryStorage>>,
     session_storage_registration: StorageRegistration,
@@ -135,7 +115,7 @@ impl<S> AgentBuilder<S> {
         plugin: impl Plugin + 'static,
         config: serde_json::Value,
     ) -> Self {
-        self.plugins.push(RegisteredPlugin {
+        self.plugins.push(ConfiguredPlugin {
             instance: Arc::new(plugin),
             config,
         });
@@ -175,7 +155,7 @@ impl<S> AgentBuilder<S> {
         let tools = build_tool_registry(&self.tools)?;
         let skills = build_skill_registry(&self.skills, &tools)?;
         let (plugin_instances, plugins, hook_registry) =
-            build_plugin_registry(self.plugins).await?;
+            PluginManager::new().build(self.plugins).await?;
 
         Ok(Agent::new(AgentKernel {
             config: self.config,
@@ -399,99 +379,4 @@ fn build_skill_registry(skills: &[SkillDefinition], tools: &ToolRegistry) -> Res
     }
 
     Ok(registry)
-}
-
-async fn build_plugin_registry(
-    plugins: Vec<RegisteredPlugin>,
-) -> Result<(
-    Vec<Arc<dyn Plugin>>,
-    IndexMap<String, crate::ports::PluginDescriptor>,
-    HookRegistry,
-)> {
-    let descriptors = collect_plugin_descriptors(&plugins)?;
-    let mut initialized_plugins: Vec<Arc<dyn Plugin>> = Vec::new();
-
-    for plugin in &plugins {
-        let descriptor = plugin.instance.descriptor();
-        if let Err(source) = plugin.instance.initialize(plugin.config.clone()).await {
-            rollback_plugins(&initialized_plugins).await;
-            return Err(AgentError::PluginInitFailed {
-                id: descriptor.id,
-                source,
-            });
-        }
-        initialized_plugins.push(Arc::clone(&plugin.instance));
-    }
-
-    let hook_registry = match apply_plugins(&plugins, &descriptors) {
-        Ok(hook_registry) => hook_registry,
-        Err(error) => {
-            rollback_plugins(&initialized_plugins).await;
-            return Err(error);
-        }
-    };
-    Ok((initialized_plugins, descriptors, hook_registry))
-}
-
-fn collect_plugin_descriptors(
-    plugins: &[RegisteredPlugin],
-) -> Result<IndexMap<String, crate::ports::PluginDescriptor>> {
-    let mut descriptors = IndexMap::new();
-
-    for plugin in plugins {
-        let descriptor = plugin.instance.descriptor();
-        if descriptors.contains_key(&descriptor.id) {
-            return Err(AgentError::NameConflict {
-                kind: "plugin",
-                name: descriptor.id,
-            });
-        }
-
-        descriptors.insert(descriptor.id.clone(), descriptor);
-    }
-
-    Ok(descriptors)
-}
-
-fn apply_plugins(
-    plugins: &[RegisteredPlugin],
-    descriptors: &IndexMap<String, crate::ports::PluginDescriptor>,
-) -> Result<HookRegistry> {
-    let mut hook_registry = HookRegistry::default();
-
-    for plugin in plugins {
-        let descriptor = plugin.instance.descriptor();
-        let mut context = PluginContext::new(descriptor.clone(), plugin.config.clone());
-        Arc::clone(&plugin.instance).apply(&mut context);
-        let registrations = context.finish()?;
-        hook_registry.extend(registrations);
-        let registered_events = hook_registry.registered_events_for_plugin(&descriptor.id);
-
-        if let Some(expected_descriptor) = descriptors.get(&descriptor.id) {
-            for hook in &expected_descriptor.tapped_hooks {
-                if !registered_events.contains(hook) {
-                    warn!(
-                        plugin_id = %expected_descriptor.id,
-                        hook = %hook.as_str(),
-                        "plugin declared a hook but did not register a handler",
-                    );
-                }
-            }
-        }
-    }
-
-    Ok(hook_registry)
-}
-
-async fn rollback_plugins(plugins: &[Arc<dyn Plugin>]) {
-    for plugin in plugins.iter().rev() {
-        if let Err(error) = plugin.shutdown().await {
-            let descriptor = plugin.descriptor();
-            warn!(
-                plugin_id = %descriptor.id,
-                error = %error,
-                "plugin shutdown failed during rollback",
-            );
-        }
-    }
 }
