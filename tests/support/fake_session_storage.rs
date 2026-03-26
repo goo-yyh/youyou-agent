@@ -14,12 +14,29 @@ use youyou_agent::{
     SessionSummary,
 };
 
+/// 会话存储可注入失败的事件类型。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FailingPayload {
+    /// 任意 `UserMessage` 事件。
+    UserMessage,
+    /// 任意 `AssistantMessage` 事件。
+    AssistantMessage,
+    /// 任意 `ToolCall` 事件。
+    ToolCall,
+    /// 任意 `ToolResult` 事件。
+    ToolResult,
+    /// 任意 `SystemMessage` 事件。
+    SystemMessage,
+    /// 指定 key 的 `Metadata` 事件。
+    Metadata(MetadataKey),
+}
+
 /// 伪造会话存储的内部状态。
 #[derive(Debug, Default)]
 struct FakeSessionStorageState {
     sessions: BTreeMap<String, Vec<LedgerEvent>>,
     summaries: BTreeMap<String, SessionSummary>,
-    fail_on_metadata_keys: Vec<MetadataKey>,
+    failing_payloads: Vec<FailingPayload>,
 }
 
 /// 基于内存的伪造会话存储。
@@ -31,15 +48,20 @@ pub struct FakeSessionStorage {
 impl FakeSessionStorage {
     /// 配置在指定 metadata key 上模拟持久化失败。
     pub fn fail_on_metadata_key(&self, key: MetadataKey) {
+        self.fail_on_payload(FailingPayload::Metadata(key));
+    }
+
+    /// 配置在指定事件类型上模拟持久化失败。
+    pub fn fail_on_payload(&self, payload: FailingPayload) {
         if let Ok(mut state) = self.state.lock() {
-            state.fail_on_metadata_keys.push(key);
+            state.failing_payloads.push(payload);
         }
     }
 
     /// 清空之前设置的失败注入规则。
     pub fn clear_failures(&self) {
         if let Ok(mut state) = self.state.lock() {
-            state.fail_on_metadata_keys.clear();
+            state.failing_payloads.clear();
         }
     }
 
@@ -105,12 +127,12 @@ impl SessionStorage for FakeSessionStorage {
             .lock()
             .map_err(|error| anyhow!("fake session storage poisoned: {error}"))?;
 
-        if let LedgerEventPayload::Metadata { key, .. } = &event.payload
-            && state.fail_on_metadata_keys.contains(key)
+        if let Some(payload) = state
+            .failing_payloads
+            .iter()
+            .find(|payload| payload_matches(payload, &event.payload))
         {
-            return Err(anyhow!(
-                "simulated metadata persistence failure for {key:?}"
-            ));
+            return Err(anyhow!("simulated persistence failure for {:?}", payload));
         }
 
         state
@@ -211,4 +233,19 @@ fn first_text_preview(content: &[youyou_agent::ContentBlock]) -> Option<String> 
             None
         }
     })
+}
+
+/// 判断失败注入规则是否命中当前事件负载。
+fn payload_matches(rule: &FailingPayload, payload: &LedgerEventPayload) -> bool {
+    match (rule, payload) {
+        (FailingPayload::UserMessage, LedgerEventPayload::UserMessage { .. })
+        | (FailingPayload::AssistantMessage, LedgerEventPayload::AssistantMessage { .. })
+        | (FailingPayload::ToolCall, LedgerEventPayload::ToolCall { .. })
+        | (FailingPayload::ToolResult, LedgerEventPayload::ToolResult { .. })
+        | (FailingPayload::SystemMessage, LedgerEventPayload::SystemMessage { .. }) => true,
+        (FailingPayload::Metadata(expected_key), LedgerEventPayload::Metadata { key, .. }) => {
+            expected_key == key
+        }
+        _ => false,
+    }
 }
