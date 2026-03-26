@@ -64,10 +64,17 @@ let agent = AgentBuilder::new(config)
 
 ```rust
 use tokio_stream::StreamExt;
-use youyou_agent::{AgentEventPayload, SessionConfig, UserInput};
+use youyou_agent::{AgentEventPayload, ContentBlock, SessionConfig, UserInput};
 
 let session = agent.new_session(SessionConfig::default()).await?;
-let mut turn = session.send_message(UserInput { content: vec![] }, None).await?;
+let mut turn = session
+    .send_message(
+        UserInput {
+            content: vec![ContentBlock::Text("hello".to_string())],
+        },
+        None,
+    )
+    .await?;
 
 while let Some(event) = turn.events.next().await {
     match event.payload {

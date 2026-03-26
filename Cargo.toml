@@ -1,18 +1,16 @@
 [package]
 name = "youyou-agent"
 version = "0.1.0"
-authors = ["Your Name <YourName@yourdomain.com>"]
+authors = ["俞樾珲 <m18758428901@163.com>"]
 edition = "2024"
 license = "MIT"
-documentation = "https://docs.rs/"
-repository = "https://github.com/TODO"
-homepage = "https://github.com/TODO"
-description = """
-
-"""
+documentation = "https://docs.rs/youyou-agent"
+repository = "https://github.com/goo-yyh/youyou-agent"
+homepage = "https://github.com/goo-yyh/youyou-agent"
+description = "A single-session Rust agent kernel with ledger-backed recovery, tool execution, compaction, hooks, and memory orchestration."
 readme = "README.md"
 categories = ["development-tools"]
-keywords = []
+keywords = ["agent", "llm", "session", "tooling", "rust"]
 
 [dependencies]
 anyhow = "1.0.102"
