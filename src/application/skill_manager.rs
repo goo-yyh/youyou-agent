@@ -2,7 +2,7 @@
 
 use indexmap::IndexMap;
 
-use crate::domain::{AgentError, ContentBlock, Message, Result, SkillDefinition, UserInput};
+use crate::domain::{ContentBlock, Message, Result, SkillDefinition, UserInput};
 
 /// Skill 管理器。
 ///
@@ -56,18 +56,16 @@ impl SkillManager {
         (matched_skills, unknown_skills)
     }
 
-    /// 解析并校验用户输入中的 Skill 调用。
+    /// 解析用户输入中的 Skill 调用。
+    ///
+    /// 未识别的 `/name` 片段会被忽略，以便将原始文本继续传给模型，
+    /// 避免路径、接口路由等 slash token 阻断整个 turn。
     ///
     /// # Errors
     ///
-    /// 当输入中包含未注册的 Skill 名称时，返回首个未识别的
-    /// [`AgentError::SkillNotFound`]。
+    /// 当前不会因为未识别的 Skill 失败。保留 `Result` 仅用于维持现有 API 兼容。
     pub fn resolve_invocations(&self, input: &UserInput) -> Result<Vec<&SkillDefinition>> {
-        let (matched_skills, unknown_skills) = self.parse_invocations(input);
-
-        if let Some(skill_name) = unknown_skills.into_iter().next() {
-            return Err(AgentError::SkillNotFound(skill_name));
-        }
+        let (matched_skills, _unknown_skills) = self.parse_invocations(input);
 
         Ok(matched_skills)
     }
@@ -115,7 +113,7 @@ fn parse_skill_names(text: &str) -> Vec<String> {
                 cursor += 1;
             }
 
-            if !skill_name.is_empty() {
+            if !skill_name.is_empty() && is_invocation_suffix(&characters, cursor) {
                 skill_names.push(skill_name);
                 index = cursor;
                 continue;
@@ -134,6 +132,54 @@ fn is_invocation_prefix(previous: Option<char>) -> bool {
     previous.is_none_or(|character| {
         character.is_whitespace() || matches!(character, '(' | '[' | '{' | '"' | '\'')
     })
+}
+
+/// 判断 Skill 名称后的字符是否仍然符合显式调用语义。
+///
+/// 绝对路径、API 路由、文件名等更像“slash token”而不是显式 Skill 调用，
+/// 这里通过后缀约束将它们排除。
+#[must_use]
+fn is_invocation_suffix(characters: &[char], cursor: usize) -> bool {
+    let next = characters.get(cursor).copied();
+    let following = characters.get(cursor + 1).copied();
+
+    match next {
+        None => true,
+        Some(character)
+            if character.is_whitespace()
+                || matches!(
+                    character,
+                    ')' | ']' | '}' | '"' | '\'' | ',' | ':' | ';' | '!' | '?'
+                ) =>
+        {
+            true
+        }
+        Some('.') => following.is_none_or(is_non_path_terminator),
+        Some(character) => is_non_path_terminator(character),
+    }
+}
+
+#[must_use]
+fn is_non_path_terminator(character: char) -> bool {
+    matches!(
+        character,
+        ')' | ']'
+            | '}'
+            | '"'
+            | '\''
+            | ','
+            | ':'
+            | ';'
+            | '!'
+            | '?'
+            | '，'
+            | '。'
+            | '！'
+            | '？'
+            | '；'
+            | '：'
+            | '、'
+    )
 }
 
 /// 判断字符是否可作为 Skill 名称的一部分。
@@ -183,5 +229,28 @@ mod tests {
         let message = manager.render_injection(skill);
 
         assert!(matches!(message, Message::System { .. }));
+    }
+
+    #[test]
+    fn test_should_not_parse_paths_as_skill_invocations() {
+        let manager = SkillManager::new(vec![
+            sample_skill("tmp", true),
+            sample_skill("api", true),
+            sample_skill("commit", true),
+        ]);
+        let input = UserInput {
+            content: vec![ContentBlock::Text(
+                "inspect /tmp/project and /api/v1/users, then run /commit.".to_string(),
+            )],
+        };
+
+        let (matched, unknown) = manager.parse_invocations(&input);
+        let matched_names = matched
+            .iter()
+            .map(|skill| skill.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(matched_names, vec!["commit"]);
+        assert!(unknown.is_empty());
     }
 }

@@ -85,7 +85,7 @@ impl SessionHandle {
     ///
     /// # Errors
     ///
-    /// 当输入非法、Session 已失效、当前已有运行中 turn，或 Skill 解析失败时返回错误。
+    /// 当输入非法、Session 已失效，或当前已有运行中 turn 时返回错误。
     pub async fn send_message(
         &self,
         input: UserInput,

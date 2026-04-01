@@ -95,7 +95,7 @@ fn implicit_skill_list_only_contains_allow_implicit_invocation() {
 }
 
 #[test]
-fn unknown_skill_fails_before_turn_starts() {
+fn test_should_ignore_unknown_skills_when_resolving_invocations() {
     let manager = SkillManager::new(vec![sample_skill("commit", true)]);
     let input = UserInput {
         content: vec![ContentBlock::Text("/missing".to_string())],
@@ -103,10 +103,30 @@ fn unknown_skill_fails_before_turn_starts() {
 
     let result = manager.resolve_invocations(&input);
 
-    assert!(matches!(
-        result,
-        Err(AgentError::SkillNotFound(name)) if name == "missing"
-    ));
+    assert!(result.expect("unknown skills should be ignored").is_empty());
+}
+
+#[test]
+fn test_should_not_treat_paths_as_skill_invocations() {
+    let manager = SkillManager::new(vec![
+        sample_skill("tmp", true),
+        sample_skill("api", true),
+        sample_skill("commit", true),
+    ]);
+    let input = UserInput {
+        content: vec![ContentBlock::Text(
+            "请检查 /tmp/project、/api/v1/users，然后执行 /commit。".to_string(),
+        )],
+    };
+
+    let result = manager.resolve_invocations(&input);
+    let matched_names = result
+        .expect("path-like slash tokens should not fail resolution")
+        .into_iter()
+        .map(|skill| skill.name.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(matched_names, vec!["commit"]);
 }
 
 #[test]
